@@ -1,0 +1,63 @@
+name: Repo Dispatcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '目標平台（留空編譯所有支援的機型）'
+        required: false
+      snapshot:
+        description: '快照版本（預設停用，輸入1啟用）'
+        required: false
+      ccache:
+        description: 'ccache（預設啟用，輸入0停用）'
+        required: false
+      clean:
+        description: '繞過toolchain快取（預設停用，輸入1啟用）'
+        required: false
+      cancel:
+        description: '停止執行中的workflows（預設停用，輸入1啟用，輸入2啟用並繼續編譯）'
+        required: false
+      delete:
+        description: '刪除所有workflows（預設停用，輸入1啟用，輸入2啟用並繼續編譯）'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Cancel Running Workflows
+      uses: styfle/cancel-workflow-action@main
+      if: github.event.inputs.cancel=='1' || github.event.inputs.cancel=='2'
+      with:
+        ignore_sha: true
+        workflow_id: ${{secrets.WORK_ID}}
+        access_token: ${{github.token}}
+
+    - name: Delete workflows Runs
+      uses: maha-1912/delete-workflow-runs@main
+      if: github.event.inputs.delete=='1' || github.event.inputs.delete=='2'
+      with:
+        retain_min: 0
+        keep_minimum_runs: 0
+
+    - name: Trigger Compile
+      if: github.event.inputs.cancel != '1' && github.event.inputs.delete != '1'
+      run: |
+        A=$(curl --connect-timeout 9 --retry 3 --retry-all-errors -LfSsH "Authorization: Bearer ${{secrets.OP_TOKEN}}" -H "Accept: application/vnd.github.raw" ${{secrets.TARGET_URL}} | grep Platform | cut -d: -f2)
+        [ -z "${{github.event.inputs.target}}" ] && B=$A || B="${{github.event.inputs.target}}";B=${B^^}
+        for i in $B;do
+            if ! echo $A | grep -q $i;then
+                echo "不支援的機型：$i!";exit 1
+            fi
+        done
+        [ "${{github.event.inputs.snapshot}}" = 1 ] && C=true || C=false
+        [ "${{github.event.inputs.ccache}}" = 0 ] && D=false || D=true
+        [ "${{github.event.inputs.clean}}" = 1 ] && E=true || E=false
+        A=$(echo $B | jq -cR 'split(" ")')
+        curl --connect-timeout 9 --retry 3 --retry-all-errors -LfSs \
+        -X POST https://api.github.com/repos/${{github.repository}}/dispatches \
+        -H "Authorization: Bearer ${{github.token}}" \
+        -H "Accept: application/vnd.github+json" \
+        -d '{"event_type":"OpenWrt-Build'$([ $C = true ] && echo -SNAPSHOT)' ('"$B"')","client_payload":{"target":'"$A"',"snapshot":'$C',"ccache":'$D',"clean":'$E'}}' && echo "啟動$B編譯成功!" || echo "啟動$B編譯失敗!"

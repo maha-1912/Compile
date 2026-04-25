@@ -1,0 +1,145 @@
+name: OpenWrt-AutoBuild
+
+on:
+  repository_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Build ${{matrix.target}}
+    env:
+      REPO_URL: https://github.com/openwrt/openwrt.git
+      UPLOAD_BIN_DIR: false
+      ORGANIZE_FIRMWARE: true
+      UPLOAD_FIRMWARE: true
+      UPLOAD_MEGA: false
+      OP_TARGET: ${{matrix.target}}
+      SNAPSHOT: ${{github.event.client_payload.snapshot}}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{github.event.client_payload.target}}
+
+    steps:
+    - name: Maximize build space
+      if: false
+      uses: maha-1912/maximize-build-space@main
+      with:
+        root-reserve-mb: 4096
+        swap-size-mb: 4096
+        temp-reserve-mb: 2048
+        remove-dotnet: 'false'
+        remove-android: 'false'
+        remove-haskell: 'false'
+        remove-codeql: 'false'
+        remove-docker-images: 'false'
+        remove-large-packages: 'false'
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo timedatectl set-timezone Asia/Shanghai
+        #sudo -E apt-get remove --purge man-db -y >/dev/null
+        sudo ln -sf /bin/true /usr/bin/mandb
+        sudo -E apt-get update >/dev/null
+        #openssl shc p7zip-full is required
+        P="openssl shc p7zip-full build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev python3-pyelftools rsync swig unzip zlib1g-dev file wget"
+        echo -e Installing:"\n$P"
+        sudo -E apt-get install $P >/dev/null
+        echo "Clean..."
+        sudo -E apt-get clean >/dev/null
+
+    - name: Clone source code
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL openwrt
+        curl --connect-timeout 9 --retry 3 --retry-all-errors -LfSsO -H "Authorization: Bearer ${{secrets.OP_TOKEN}}" -H "Accept: application/vnd.github.raw" ${{secrets.GIT_SCRIPT}}
+        curl --connect-timeout 9 --retry 3 --retry-all-errors -LfSsO -H "Authorization: Bearer ${{secrets.OP_TOKEN}}" -H "Accept: application/vnd.github.raw" ${{secrets.HASH_FILE}}
+        chmod +x git.sh && ./git.sh && rm git.sh
+
+    - name: Cache
+      uses: stupidloud/cachewrtbuild@a34e3f9525f23ac459cdb22ee67ae8935eb1abd9
+      with:
+        ccache: ${{github.event.client_payload.ccache}}
+        mixkey: ${{matrix.target}}
+        clean: ${{github.event.client_payload.clean}}
+        prefix: ${{github.workspace}}/openwrt
+
+    - name: Update feeds
+      run: |
+        cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: |
+        cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        echo "Clone OpenWrt Custom"
+        git clone -q --depth 1 https://${{secrets.OP_TOKEN}}@${{secrets.OP_URL}} OpenWrt_Custom
+        mv OpenWrt_Custom/diy.sh .
+        chmod +x diy.sh && ./diy.sh && rm diy.sh
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        rm -rf tmp
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Build firmware
+      id: build
+      run: |
+        cd openwrt
+        echo -e "$(($(nproc)+1)) thread build"
+        make -j$(($(nproc)+1)) || make -j1 V=s
+        grep -q 'CONFIG_TARGET_x86=y\|CONFIG_TARGET_armvirt=y' .config && grep '^CONFIG_ARCH=' .config | sed -r 's/.*"(.+)".*/\1/' > DEVICE_NAME || grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && ([ $(cat DEVICE_NAME) = phicomm_k2p ] && echo "DEVICE_NAME=_${OP_TARGET,,}" >> $GITHUB_ENV || echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV)
+        echo "VERSION=_$(sed '/^DISTRIB_RELEASE=/!d;s/.*=//' package/base-files/files/etc/openwrt_release | sed "s/'//g" | awk '{print $1}')" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Check space usage
+      if: steps.build.outputs.status == 'success'
+      run: df -hT $PWD
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{env.DEVICE_NAME}}
+        path: openwrt/bin
+
+    - name: Organize files
+      env:
+        ZIP_PASS: ${{secrets.ZIP_PASS}}
+      id: organize
+      if: steps.build.outputs.status == 'success' && env.ORGANIZE_FIRMWARE == 'true'
+      run: |
+        curl --connect-timeout 9 --retry 3 --retry-all-errors -LfSsO -H "Authorization: Bearer ${{secrets.OP_TOKEN}}" -H "Accept: application/vnd.github.raw" ${{secrets.ORGANIZE_SCRIPT}}
+        curl --connect-timeout 9 --retry 3 --retry-all-errors -LfSsO -H "Authorization: Bearer ${{secrets.OP_TOKEN}}" -H "Accept: application/vnd.github.raw" ${{secrets.VERSION_FILE}}
+        chmod +x organize.sh && ./organize.sh && rm organize.sh
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{env.DEVICE_NAME}}
+        path: ${{env.FIRMWARE}}
+
+    - name: Upload firmware to MEGA
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_MEGA == 'true' && !cancelled()
+      run: |
+        curl -LfSsO https://github.com/${{github.repository}}/raw/main/megatools_amd64.deb
+        sudo -E dpkg -i megatools_amd64.deb >/dev/null
+        megatools mkdir /Root/OpenWrt -u ${{secrets.MEGA_EMAIL}} -p ${{secrets.MEGA_PASSWORD}} 2>/dev/null || true
+        for i in $FIRMWARE/*;do
+          if [ -s $i ];then
+            for p in /Root/OpenWrt /Trash;do megatools rm $p/${i##*/} -u ${{secrets.MEGA_EMAIL}} -p ${{secrets.MEGA_PASSWORD}} 2>/dev/null || true;done
+            echo "Uploading ${i##*/}"
+            megatools put --path /Root/OpenWrt $i -u ${{secrets.MEGA_EMAIL}} -p ${{secrets.MEGA_PASSWORD}}
+          fi
+        done
